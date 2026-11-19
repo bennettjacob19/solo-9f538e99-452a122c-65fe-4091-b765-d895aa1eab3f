@@ -51,6 +51,39 @@ pytest tests/ -v
    `attempts[]` 列出每次探测（`probe`）与小包复核（`link-verify`）的尺寸、结果与 RTT。
 4. 历史结论：`GET /probes`、`GET /probe/{probe_id}`（内存保留最近 200 条）。
 
+## 接收缓冲区演练（停读丢包对账）
+
+遥测网关短时停读后丢了包，调大 `SO_RCVBUF` 到底有没有用？`POST /rcvbuf/drill`
+在 /docs 填入 **MTUP 报文长度（28～1400 字节）**、**包数（最多 4096）** 和
+**两档 SO_RCVBUF 请求值**，当次给出对照结论：
+
+```json
+{"message_size": 1400, "packet_count": 3000, "rcvbuf_requests": [65536, 2097152]}
+```
+
+- 每档各建一对独立的本机 UDP 套接字：接收端设置该档 `SO_RCVBUF`，发送端把
+  同一批 MTUP 报文**整批发完才开始读**——复现"停读期间缓冲区被灌满"；
+- 两档共用**演练开始时**的回显配置（快照 + epoch），接收端逐包记录
+  `序号 / 实际使用的配置版本 / 判定（pass 放行、disconnect_drop 断联丢弃、
+  over_limit_drop 超限丢弃）`；
+- 排空后读取该接收套接字的**内核溢出终值**（`/proc/net/udp` 的 drops 列，
+  即 `sk_drops`，减去演练前基线），三方对账：
+  `发送成功 = 实收 + 内核溢出 + 未归因`；
+- 当次返回两档**实际缓冲区大小**（`getsockopt`，内核通常翻倍并封顶
+  `net.core.rmem_max`）、逐包判定，以及发送失败 / 放行 / 规则丢弃 /
+  内核溢出 / 未归因的包数。
+
+推荐规则：
+
+| `recommendation.status` | 含义 |
+|---|---|
+| `recommended` | 两档均整批发出且对账无缺口，推荐**零溢出中实际缓冲区最小**的一档 |
+| `insufficient` | 两档均发生内核溢出，**两档缓冲区均不足** |
+| `unavailable` | 发送失败或证据不全（对账有缺口 / 内核计数不可读），给出原因，**暂不推荐** |
+
+并行演练互不干扰：每次演练、每档都使用独立临时端口套接字，回显配置只在
+演练开始时读取一次；结束或中断后各档套接字都会关闭，`/probe` 照常服务。
+
 ## 判定规则与需求对应
 
 - **禁止 IP 分片**：探测与回显 socket 均设置 `IP_MTU_DISCOVER/IP_PMTUDISC_DO`（DF=1），
@@ -80,8 +113,10 @@ app/
   main.py        # FastAPI 路由与生命周期
   echo_server.py # 本地回显端（阈值丢弃/断联，epoch）
   prober.py      # 二分探测引擎（DF、探测编号、小包复核、作废判定）
+  rcvbuf.py      # 接收缓冲区演练（两档 SO_RCVBUF 对照、逐包判定、内核溢出对账）
   packets.py     # 探测报文编解码
   netutil.py     # DF 位设置
-tests/test_api.py
+tests/test_api.py     # 探测与配置端到端测试
+tests/test_rcvbuf.py  # 接收缓冲区演练端到端测试
 Dockerfile / docker-compose.yml
 ```

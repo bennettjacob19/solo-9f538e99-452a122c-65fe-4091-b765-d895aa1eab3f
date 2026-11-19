@@ -1,4 +1,4 @@
-"""FastAPI 入口：探测 API + 本地回显端配置。
+"""FastAPI 入口：探测 API + 本地回显端配置 + 接收缓冲区演练。
 
 - ``GET  /``                服务简介
 - ``GET  /echo/config``     查看回显端当前配置与 epoch
@@ -6,6 +6,7 @@
 - ``POST /probe``           发起一次探测（默认范围 576~1400 字节）
 - ``GET  /probe/{id}``      查询历史探测结论
 - ``GET  /probes``          历史探测结论列表
+- ``POST /rcvbuf/drill``    接收缓冲区演练：两档 SO_RCVBUF 对照，停读丢包对账
 
 交互式文档见 ``/docs``。
 """
@@ -23,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from .echo_server import EchoConfig, EchoProtocol, EchoState
 from .netutil import set_dont_fragment
 from .prober import ProbeRequest, ProbeResult, Prober
+from .rcvbuf import DrillRequest, DrillResult, RcvbufDrill
 
 ECHO_HOST = os.environ.get("ECHO_HOST", "0.0.0.0")
 ECHO_PORT = int(os.environ.get("ECHO_PORT", "9999"))
@@ -60,13 +62,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="遥测网关 UDP 最大负载探测",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "小包能到回显端、大包却超时？用本服务确认遥测网关可用的最大 UDP 负载。\n\n"
         "- 探测报文带 DF 位（禁止 IP 分片）与本次探测编号，只有对应回包才算成功；\n"
         "- 大包超时/发送失败先用小包复核，小包也失败则报告链路不确定；\n"
         "- 探测期间改动回显端配置会使本次结论作废；\n"
-        "- 在下方 `PUT /echo/config` 设置丢弃阈值或断联，再 `POST /probe` 验证。"
+        "- 在下方 `PUT /echo/config` 设置丢弃阈值或断联，再 `POST /probe` 验证；\n"
+        "- 短时停读丢包？用 `POST /rcvbuf/drill` 对照两档 SO_RCVBUF：整批发完才开始读，"
+        "逐包判定 + 内核溢出对账，给出是否调大接收缓冲区的推荐。"
     ),
     lifespan=lifespan,
 )
@@ -80,6 +84,7 @@ async def index() -> dict:
         "endpoints": {
             "config": ["GET /echo/config", "PUT /echo/config"],
             "probe": ["POST /probe", "GET /probes", "GET /probe/{probe_id}"],
+            "rcvbuf": ["POST /rcvbuf/drill"],
         },
     }
 
@@ -140,3 +145,14 @@ async def list_probes(request: Request) -> list[dict]:
         }
         for r in reversed(list(results.values()))
     ]
+
+
+@app.post("/rcvbuf/drill", response_model=DrillResult, summary="接收缓冲区演练（停读丢包对账）")
+async def run_rcvbuf_drill(req: DrillRequest, request: Request) -> DrillResult:
+    # 每次演练独立实例：两档各用独立本机套接字，并行演练互不干扰
+    drill = RcvbufDrill(request.app.state.echo_state)
+    try:
+        return await drill.run(req)
+    except OSError as exc:
+        # 本机套接字创建/绑定失败等，演练未能完成
+        raise HTTPException(status_code=500, detail=f"演练未能完成: {exc}") from exc
